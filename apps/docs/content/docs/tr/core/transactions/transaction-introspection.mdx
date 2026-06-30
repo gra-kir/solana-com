@@ -1,0 +1,206 @@
+---
+title: İşlem İçgözlemi
+description:
+  "@solana/transaction-introspection ile onaylanmış bir Solana işlemini
+  çözümleyin ve inceleyin - hesap indekslerini ve arama tablosu adreslerini
+  çözün, dış ve iç (CPI) talimatları gezin ve bunları program istemcileriyle
+  ayrıştırın."
+url: /docs/core/transactions/transaction-introspection
+type: conceptual
+prerequisites:
+  - /docs/core/transactions/transaction-structure
+  - /docs/core/instructions/instruction-structure
+related:
+  - /docs/core/transactions/versioned-transactions
+  - /docs/rpc/http/gettransaction
+---
+
+<Callout type="info" title="Özet">
+  `@solana/transaction-introspection`, bir `getTransaction` RPC yanıtını gerçek
+  adreslerle birlikte bir talimat listesine dönüştürür. Hesap indekslerini
+  (arama tablosu adresleri dahil) çözer, iç Cross Program Invocation
+  talimatlarını çözümler ve tam talimat ağacını gezgin sırasına göre dolaşır.
+</Callout>
+
+<Callout type="info">
+  Bir programın çalışma zamanında _zincir üzerinde_ kardeş talimatları nasıl
+  incelediğini mi arıyorsunuz? Bu, Instructions sysvar'dır - bkz. [Talimat
+  İçgözlemi](/docs/core/instructions/instruction-introspection). Bu sayfa bir
+  RPC yanıtından işlemin _zincir dışında_ çözümlenmesiyle ilgilidir.
+</Callout>
+
+Bir [`getTransaction`](/docs/rpc/http/gettransaction) yanıtı, kullanıma hazır
+bir talimat listesi sunmaz. Hesaplar sayısal indeksler olarak saklanır,
+[sürümlü işlemler](/docs/core/transactions/versioned-transactions) bu hesapları
+statik anahtarlar ile
+[Adres Arama Tabloları](/docs/core/transactions/versioned-transactions)'ndan
+yüklenen adreslere böler ve Cross Program Invocation'lardan (CPI) gelen iç
+talimatlar, işlem meta verisinde kodlanmış bloblar olarak gelir.
+
+`@solana/transaction-introspection` bu çözümlemeyi sizin için yapar. Ham işlemi
+çözümler, her hesap indeksini kendi `Address` değerine eşler, iç talimatları
+normalleştirir ve talimatları bir blok gezgininin gösterdiği dış-sonra-iç
+sırayla döndürür. Döndürülen talimatlar, codama tarafından oluşturulan
+istemcilerin (örn. `@solana-program/*`) `parseXInstruction` yardımcılarına
+doğrudan takılır.
+
+```shell title="Terminal"
+npm install @solana/transaction-introspection @solana/kit @solana/instructions @solana-program/token
+```
+
+## Yanıtı Çözümleme
+
+İşlemi ham format kodlamasıyla alın ve yanıtı
+`decodeTransactionFromRpcResponse`'e aktarın.
+
+```ts title="Decode a transaction"
+import { createSolanaRpc, signature } from "@solana/kit";
+import { decodeTransactionFromRpcResponse } from "@solana/transaction-introspection";
+
+const rpc = createSolanaRpc("https://api.mainnet-beta.solana.com");
+
+const txid =
+  "3jUKrQp1UGq5ih6FTDUUt2kkqUfoG2o4kY5T1DoVHK2tXXDLdxJSXzuJGY4JPoRivgbi45U2bc7LZfMa6C4R3szX";
+
+const rpcTx = await rpc
+  .getTransaction(signature(txid), {
+    commitment: "confirmed",
+    encoding: "base64",
+    maxSupportedTransactionVersion: 0
+  })
+  .send();
+if (!rpcTx) throw new Error(`Transaction ${txid} not found`);
+
+const { compiledMessage, loadedAddresses } =
+  decodeTransactionFromRpcResponse(rpcTx);
+```
+
+Kalan kod parçacıkları bu adımdaki `rpcTx`, `compiledMessage` ve
+`loadedAddresses` değerlerini yeniden kullanır.
+
+<Callout type="warn">
+  `base64`, `base58` veya `json` kodlamasıyla alın.
+  `decodeTransactionFromRpcResponse`, `jsonParsed` yanıtlarını reddeder - bu
+  kodlama, RPC düğümünden talimatları sunucu tarafında ayrıştırmasını ister,
+  dolayısıyla istemci tarafında çözümlenecek hiçbir şey kalmaz.
+</Callout>
+
+## Talimatları gez
+
+`walkInstructions`, bir blok gezgininin gösterdiği sırayla — her dış talimatın
+hemen ardından o talimatın CPI'ları aracılığıyla ürettiği iç talimatlar gelecek
+şekilde — tüm talimatları (dış ve iç) bir dizi olarak döndürür. Her talimat,
+çağrı hiyerarşisindeki konumunu açıklayan bir `trace` alanı taşır.
+
+```ts title="Walk every instruction"
+import { walkInstructions } from "@solana/transaction-introspection";
+
+for (const ix of walkInstructions({
+  compiledMessage,
+  loadedAddresses,
+  meta: rpcTx.meta
+})) {
+  const location =
+    ix.trace.kind === "outer"
+      ? `outer[${ix.trace.index}]`
+      : `inner[${ix.trace.outerIndex}/${ix.trace.innerIndex}]`;
+  console.log(location, ix.programAddress, ix.accounts?.length ?? 0);
+}
+```
+
+`trace` ayrıştırılmış bir birleşimdir: üst düzey bir talimat için
+`{ kind: "outer", index }`, ya da bir dış talimatın altında yuvalanmış CPI
+talimatı için `{ kind: "inner", outerIndex, innerIndex, stackHeight? }`.
+
+`meta` isteğe bağlıdır — `null` olabilecek durumlarda bile `rpcTx.meta` değerini
+doğrudan geçin. Meta veri olmadığında `walkInstructions` yalnızca dış
+talimatları döndürür.
+
+## Program istemcisiyle ayrıştır
+
+`walkInstructions`'den gelen her talimat bir `ResolvedInstruction` olduğundan,
+`@solana/instructions`'den gelen koşullarla ve `@solana-program/*` istemcileri
+tarafından üretilen `identifyXInstruction` / `parseXInstruction` yardımcılarıyla
+herhangi bir dönüştürme adımı gerekmeksizin doğrudan çalışır.
+
+Bu örnek, bir işlemdeki her Token Program `SyncNative` talimatını — ister üst
+düzeyde çalışsın ister bir CPI içinde — denetler.
+
+```ts title="Find and parse SyncNative instructions"
+import {
+  isInstructionForProgram,
+  isInstructionWithAccounts,
+  isInstructionWithData
+} from "@solana/instructions";
+import { walkInstructions } from "@solana/transaction-introspection";
+import {
+  identifyTokenInstruction,
+  parseSyncNativeInstruction,
+  TOKEN_PROGRAM_ADDRESS,
+  TokenInstruction
+} from "@solana-program/token";
+
+for (const ix of walkInstructions({
+  compiledMessage,
+  loadedAddresses,
+  meta: rpcTx.meta
+})) {
+  if (!isInstructionForProgram(ix, TOKEN_PROGRAM_ADDRESS)) continue;
+  if (!isInstructionWithData(ix) || !isInstructionWithAccounts(ix)) continue;
+  if (identifyTokenInstruction(ix) !== TokenInstruction.SyncNative) continue;
+
+  const parsed = parseSyncNativeInstruction(ix);
+  console.log(ix.trace, parsed);
+}
+```
+
+## Alt düzey yardımcılar
+
+`walkInstructions` çoğu ihtiyacı karşılar, ancak paket aynı zamanda üzerine inşa
+edildiği parçaları da dışa aktarır:
+
+- `getInstructionsFromCompiledTransactionMessage(compiledMessage, loadedAddresses?)`
+  yalnızca dış talimatları çözümlenmiş hesaplar ve çözümlenmiş verilerle
+  birlikte döndürür.
+- `getInnerInstructionsFromMeta(meta, accountMetas)`, işlem meta verilerinden iç
+  CPI talimatlarını çözer.
+- `getAccountMetasFromCompiledTransactionMessage(compiledMessage, loadedAddresses?)`
+  tam hesap listesini işlem sırasıyla döndürür — bir önceki yardımcının iç
+  talimat hesap indekslerini çözümlemek için ihtiyaç duyduğu giriştir.
+
+```ts title="Resolve outer and inner instructions separately"
+import {
+  getAccountMetasFromCompiledTransactionMessage,
+  getInnerInstructionsFromMeta,
+  getInstructionsFromCompiledTransactionMessage
+} from "@solana/transaction-introspection";
+
+const outer = getInstructionsFromCompiledTransactionMessage(
+  compiledMessage,
+  loadedAddresses
+);
+
+const accountMetas = getAccountMetasFromCompiledTransactionMessage(
+  compiledMessage,
+  loadedAddresses
+);
+
+if (!rpcTx.meta) throw new Error("Transaction metadata missing");
+const inner = getInnerInstructionsFromMeta(rpcTx.meta, accountMetas);
+```
+
+<Callout type="info" title="Rust kullanıyor musunuz?">
+  Bu paketin Rust eşdeğeri yoktur. Rust'tan ayrıştırılmış talimatlar almak için
+  [`getTransaction`](/docs/rpc/http/gettransaction) üzerinden
+  `UiTransactionEncoding::JsonParsed` isteyin ve hesapları ile iç talimatları
+  RPC düğümünün sizin için çözümlemesine izin verin.
+</Callout>
+
+## Ayrıca bakınız
+
+- [İşlem Yapısı](/docs/core/transactions/transaction-structure) - bu paketin
+  çözdüğü yanıtın anatomisi
+- [Sürümlü İşlemler](/docs/core/transactions/versioned-transactions) - Adres
+  Arama Tablolarının hesapları statik ve yüklenen gruplara nasıl böldüğü
+- [`getTransaction`](/docs/rpc/http/gettransaction) - işlemi döndüren RPC
+  yöntemi
